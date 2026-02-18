@@ -1,42 +1,30 @@
 import numpy as np
 
 from qiskit_algorithms import VQE, NumPyMinimumEigensolver
-from qiskit_algorithms.optimizers import SLSQP
+from qiskit_algorithms.optimizers import COBYLA, SLSQP
 from qiskit.primitives import Estimator
 
 from qiskit_nature.second_q.mappers import JordanWignerMapper
 from qiskit_nature.second_q.circuit.library import UCCSD, HartreeFock
 from qiskit_nature.second_q.mappers import QubitConverter
-from qiskit_nature.second_q.transformers import ActiveSpaceTransformer
 
 from qiskit.circuit.library import EfficientSU2
 
 
-# -----------------------------
+# =============================
 # Constants
-# -----------------------------
+# =============================
 HARTREE_TO_KCAL = 627.5
 CHEMICAL_ACCURACY_HARTREE = 0.0016
 
-EXACT_THRESHOLD = 10
+EXACT_THRESHOLD = 12
 UCCSD_THRESHOLD = 12
 
 
+# =============================
+# Main Solver
+# =============================
 def compute_energies(problem):
-
-    # -----------------------------
-    # Active Space Reduction (Small Systems)
-    # -----------------------------
-    if problem.num_spatial_orbitals > 4:
-        try:
-            print("Applying active space reduction...")
-            transformer = ActiveSpaceTransformer(
-                num_electrons=2,
-                num_spatial_orbitals=2
-            )
-            problem = transformer.transform(problem)
-        except Exception as e:
-            print("Active space reduction skipped:", e)
 
     # -----------------------------
     # Qubit Mapping
@@ -52,10 +40,10 @@ def compute_energies(problem):
     num_particles = problem.num_particles
     num_spatial_orbitals = problem.num_spatial_orbitals
 
-    print(f"\nDetected {num_qubits} qubits after reduction.")
+    print(f"\nDetected {num_qubits} qubits.")
 
     # -----------------------------
-    # Exact Solver (Safe Only)
+    # Exact Solver (≤12 qubits)
     # -----------------------------
     exact_energy = None
 
@@ -68,9 +56,6 @@ def compute_energies(problem):
             print("Exact energy:", exact_energy)
         except Exception as e:
             print("Exact solver failed:", str(e))
-            exact_energy = None
-    else:
-        print("Skipping exact solver (qubit count too high).")
 
     # -----------------------------
     # Hartree-Fock Initial State
@@ -97,7 +82,7 @@ def compute_energies(problem):
         print("Using EfficientSU2 ansatz.")
         ansatz = EfficientSU2(
             num_qubits=num_qubits,
-            reps=3,
+            reps=2,
             entanglement="full"
         )
         ansatz_name = "EfficientSU2"
@@ -105,32 +90,66 @@ def compute_energies(problem):
     print(f"Ansatz parameters: {ansatz.num_parameters}")
     print(f"Circuit depth: {ansatz.decompose().depth()}")
 
-    # -----------------------------
-    # VQE
-    # -----------------------------
+    estimator = Estimator()
+
     convergence_history = []
 
     def callback(eval_count, parameters, mean, std):
         convergence_history.append(float(mean))
 
-    optimizer = SLSQP(maxiter=200)
-    estimator = Estimator()
+    # =============================
+    # Optimizer Strategy
+    # =============================
 
-    vqe = VQE(
-        estimator,
-        ansatz,
-        optimizer,
-        callback=callback
-    )
+    if num_qubits <= 12:
+        # --- Stage 1: Fast rough convergence ---
+        print("Stage 1: COBYLA rough optimization...")
+        optimizer1 = COBYLA(maxiter=150)
 
-    print("Starting VQE optimization...")
-    vqe_result = vqe.compute_minimum_eigenvalue(qubit_op)
-    vqe_energy = float(np.real(vqe_result.eigenvalue))
-    print("VQE energy:", vqe_energy)
+        vqe1 = VQE(
+            estimator,
+            ansatz,
+            optimizer1,
+            callback=callback
+        )
 
-    # -----------------------------
+        result1 = vqe1.compute_minimum_eigenvalue(qubit_op)
+        stage1_energy = float(np.real(result1.eigenvalue))
+        print("Stage 1 energy:", stage1_energy)
+
+        # --- Stage 2: Precision refinement ---
+        print("Stage 2: SLSQP precision refinement...")
+        optimizer2 = SLSQP(maxiter=80, ftol=1e-6)
+
+        vqe2 = VQE(
+            estimator,
+            ansatz,
+            optimizer2,
+            initial_point=result1.optimal_point,
+            callback=callback
+        )
+
+        result = vqe2.compute_minimum_eigenvalue(qubit_op)
+
+    else:
+        print("Single-stage optimization (large system).")
+        optimizer = COBYLA(maxiter=200)
+
+        vqe = VQE(
+            estimator,
+            ansatz,
+            optimizer,
+            callback=callback
+        )
+
+        result = vqe.compute_minimum_eigenvalue(qubit_op)
+
+    vqe_energy = float(np.real(result.eigenvalue))
+    print("Final VQE energy:", vqe_energy)
+
+    # =============================
     # Metrics
-    # -----------------------------
+    # =============================
     error = None
     error_kcal = None
     within_chemical_accuracy = None
@@ -139,6 +158,9 @@ def compute_energies(problem):
         error = abs(vqe_energy - exact_energy)
         error_kcal = error * HARTREE_TO_KCAL
         within_chemical_accuracy = error < CHEMICAL_ACCURACY_HARTREE
+
+        print("Error (Hartree):", error)
+        print("Chemical accuracy achieved:", within_chemical_accuracy)
 
     return {
         "ansatz_used": ansatz_name,
