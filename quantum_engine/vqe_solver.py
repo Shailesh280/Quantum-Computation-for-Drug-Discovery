@@ -1,178 +1,261 @@
 import numpy as np
 
 from qiskit_algorithms import VQE, NumPyMinimumEigensolver
-from qiskit_algorithms.optimizers import COBYLA, SLSQP
+from qiskit_algorithms.optimizers import SLSQP
 from qiskit.primitives import Estimator
 
+from qiskit_nature import settings
 from qiskit_nature.second_q.mappers import JordanWignerMapper
 from qiskit_nature.second_q.circuit.library import UCCSD, HartreeFock
 from qiskit_nature.second_q.mappers import QubitConverter
+from qiskit_nature.second_q.transformers import (
+    FreezeCoreTransformer,
+    ActiveSpaceTransformer,
+)
 
 from qiskit.circuit.library import EfficientSU2
 
 
-# =============================
-# Constants
-# =============================
-HARTREE_TO_KCAL = 627.5
-CHEMICAL_ACCURACY_HARTREE = 0.0016
+# ==================================================
+# Global Scientific Settings (API Safe)
+# ==================================================
 
-EXACT_THRESHOLD = 12
-UCCSD_THRESHOLD = 12
+settings.use_pauli_sum_op = False
+
+HARTREE_TO_KCAL = 627.509
+CHEMICAL_ACCURACY_KCAL = 1.0
+CHEMICAL_ACCURACY_HARTREE = 0.001593
+
+SAFE_QUBIT_LIMIT = 14
+TARGET_ACTIVE_ORBITALS = 4
 
 
-# =============================
+# ==================================================
+# Active Electron Selection (Safe)
+# ==================================================
+
+def choose_active_electrons(total_electrons, max_active=4):
+
+    active = min(max_active, total_electrons)
+    active -= active % 2
+
+    if active < 2 and total_electrons >= 2:
+        active = 2
+
+    if (total_electrons - active) % 2 != 0:
+        active -= 2
+
+    return max(0, active)
+
+
+# ==================================================
 # Main Solver
-# =============================
-def compute_energies(problem):
+# ==================================================
+def compute_energies(problem, mode="production"):
 
-    # -----------------------------
-    # Qubit Mapping
-    # -----------------------------
-    mapper = JordanWignerMapper()
-    converter = QubitConverter(mapper)
+    print("\n==============================", flush=True)
+    print(f"Starting compute_energies() | Mode: {mode}", flush=True)
 
-    second_q_ops = problem.second_q_ops()
-    main_op = second_q_ops[0]
-    qubit_op = converter.convert(main_op, num_particles=problem.num_particles)
+    # ==================================================
+    # MODE CONTROL
+    # ==================================================
 
-    num_qubits = qubit_op.num_qubits
-    num_particles = problem.num_particles
-    num_spatial_orbitals = problem.num_spatial_orbitals
+    if mode == "production":
 
-    print(f"\nDetected {num_qubits} qubits.")
+        print("Applying FreezeCore...", flush=True)
 
-    # -----------------------------
-    # Exact Solver (≤12 qubits)
-    # -----------------------------
+        try:
+            problem = FreezeCoreTransformer().transform(problem)
+        except Exception:
+            print("FreezeCore skipped.", flush=True)
+
+        try:
+            num_alpha, num_beta = problem.num_particles
+            total_electrons = num_alpha + num_beta
+            total_orbitals = problem.num_spatial_orbitals
+
+            print(f"Electrons: {total_electrons}", flush=True)
+            print(f"Orbitals: {total_orbitals}", flush=True)
+
+            active_orbitals = min(TARGET_ACTIVE_ORBITALS, total_orbitals)
+            active_electrons = choose_active_electrons(total_electrons, 4)
+
+            print(f"Active electrons: {active_electrons}", flush=True)
+            print(f"Active orbitals: {active_orbitals}", flush=True)
+
+            problem = ActiveSpaceTransformer(
+                num_electrons=active_electrons,
+                num_spatial_orbitals=active_orbitals,
+            ).transform(problem)
+
+        except Exception as e:
+            return {"solver_error": f"Active space reduction failed: {str(e)}"}
+
+        multi_starts = 1
+
+    elif mode == "benchmark":
+
+        print("Full space mode — no FreezeCore, no ActiveSpace", flush=True)
+
+        try:
+            num_alpha, num_beta = problem.num_particles
+            print(f"Electrons: {num_alpha + num_beta}", flush=True)
+            print(f"Orbitals: {problem.num_spatial_orbitals}", flush=True)
+        except Exception as e:
+            return {"solver_error": f"Metadata extraction failed: {str(e)}"}
+
+        multi_starts = 3  # stronger convergence for benchmark
+
+    else:
+        return {"solver_error": "Invalid mode. Use 'production' or 'benchmark'."}
+
+    # ==================================================
+    # Build Hamiltonian
+    # ==================================================
+
+    try:
+        print("Building Hamiltonian...", flush=True)
+
+        mapper = JordanWignerMapper()
+        converter = QubitConverter(mapper)
+
+        second_q_ops = problem.second_q_ops()
+        main_op = second_q_ops[0]
+
+        qubit_op = converter.convert(
+            main_op,
+            num_particles=problem.num_particles,
+        )
+
+        num_qubits = qubit_op.num_qubits
+        print(f"Qubits required: {num_qubits}", flush=True)
+
+        if num_qubits > SAFE_QUBIT_LIMIT:
+            return {"solver_error": f"System requires {num_qubits} qubits."}
+
+    except Exception as e:
+        return {"solver_error": f"Hamiltonian construction failed: {str(e)}"}
+
+    nuclear_repulsion = problem.nuclear_repulsion_energy
+    print(f"Nuclear repulsion: {nuclear_repulsion}", flush=True)
+
+    # ==================================================
+    # Exact Solver (for validation)
+    # ==================================================
+
     exact_energy = None
 
-    if num_qubits <= EXACT_THRESHOLD:
+    if num_qubits <= 12:
         try:
-            print("Running exact solver...")
+            print("Running Exact solver...", flush=True)
             exact_solver = NumPyMinimumEigensolver()
             exact_result = exact_solver.compute_minimum_eigenvalue(qubit_op)
-            exact_energy = float(np.real(exact_result.eigenvalue))
-            print("Exact energy:", exact_energy)
-        except Exception as e:
-            print("Exact solver failed:", str(e))
+            eigenvalue = getattr(exact_result, "eigenvalue", exact_result)
+            exact_energy = float(np.real(eigenvalue)) + nuclear_repulsion
+            print(f"Exact energy: {exact_energy}", flush=True)
+        except Exception:
+            exact_energy = None
 
-    # -----------------------------
-    # Hartree-Fock Initial State
-    # -----------------------------
+    # ==================================================
+    # Ansatz (Unified)
+    # ==================================================
+
+    print("Constructing Ansatz...", flush=True)
+
     hf = HartreeFock(
-        num_spatial_orbitals,
-        num_particles,
-        converter
+        problem.num_spatial_orbitals,
+        problem.num_particles,
+        converter,
     )
 
-    # -----------------------------
-    # Ansatz Selection
-    # -----------------------------
-    if num_qubits <= UCCSD_THRESHOLD:
-        print("Using UCCSD ansatz.")
-        ansatz = UCCSD(
-            num_spatial_orbitals=num_spatial_orbitals,
-            num_particles=num_particles,
-            qubit_converter=converter,
-            initial_state=hf,
-        )
-        ansatz_name = "UCCSD"
-    else:
-        print("Using EfficientSU2 ansatz.")
-        ansatz = EfficientSU2(
-            num_qubits=num_qubits,
-            reps=2,
-            entanglement="full"
-        )
-        ansatz_name = "EfficientSU2"
+    ansatz = UCCSD(
+        num_spatial_orbitals=problem.num_spatial_orbitals,
+        num_particles=problem.num_particles,
+        qubit_converter=converter,
+        initial_state=hf,
+    )
 
-    print(f"Ansatz parameters: {ansatz.num_parameters}")
-    print(f"Circuit depth: {ansatz.decompose().depth()}")
+    ansatz_name = "UCCSD"
 
-    estimator = Estimator()
+    print(f"Ansatz used: {ansatz_name}", flush=True)
 
-    convergence_history = []
+    estimator = Estimator(options={"shots": None})
 
-    def callback(eval_count, parameters, mean, std):
-        convergence_history.append(float(mean))
+    # ==================================================
+    # Adaptive VQE
+    # ==================================================
 
-    # =============================
-    # Optimizer Strategy
-    # =============================
+    best_energy = np.inf
 
-    if num_qubits <= 12:
-        # --- Stage 1: Fast rough convergence ---
-        print("Stage 1: COBYLA rough optimization...")
-        optimizer1 = COBYLA(maxiter=150)
+    try:
+        print("Starting VQE...", flush=True)
 
-        vqe1 = VQE(
-            estimator,
-            ansatz,
-            optimizer1,
-            callback=callback
-        )
+        # Adaptive iteration scaling
+        param_count = ansatz.num_parameters
+        adaptive_maxiter = max(300, 100 * param_count)
 
-        result1 = vqe1.compute_minimum_eigenvalue(qubit_op)
-        stage1_energy = float(np.real(result1.eigenvalue))
-        print("Stage 1 energy:", stage1_energy)
+        print(f"Adaptive maxiter: {adaptive_maxiter}", flush=True)
+        print(f"Multi-start runs: {multi_starts}", flush=True)
 
-        # --- Stage 2: Precision refinement ---
-        print("Stage 2: SLSQP precision refinement...")
-        optimizer2 = SLSQP(maxiter=80, ftol=1e-6)
+        for run in range(multi_starts):
 
-        vqe2 = VQE(
-            estimator,
-            ansatz,
-            optimizer2,
-            initial_point=result1.optimal_point,
-            callback=callback
-        )
+            print(f"VQE Run {run+1}/{multi_starts}", flush=True)
 
-        result = vqe2.compute_minimum_eigenvalue(qubit_op)
+            optimizer = SLSQP(maxiter=adaptive_maxiter)
 
-    else:
-        print("Single-stage optimization (large system).")
-        optimizer = COBYLA(maxiter=200)
+            # small random initialization for stability
+            initial_point = np.random.uniform(
+                -0.05, 0.05, param_count
+            )
 
-        vqe = VQE(
-            estimator,
-            ansatz,
-            optimizer,
-            callback=callback
-        )
+            vqe = VQE(
+                estimator=estimator,
+                ansatz=ansatz,
+                optimizer=optimizer,
+                initial_point=initial_point,
+            )
 
-        result = vqe.compute_minimum_eigenvalue(qubit_op)
+            result = vqe.compute_minimum_eigenvalue(qubit_op)
+            eigenvalue = getattr(result, "eigenvalue", result)
+            energy = float(np.real(eigenvalue)) + nuclear_repulsion
 
-    vqe_energy = float(np.real(result.eigenvalue))
-    print("Final VQE energy:", vqe_energy)
+            print(f"Run energy: {energy}", flush=True)
 
-    # =============================
-    # Metrics
-    # =============================
-    error = None
-    error_kcal = None
-    within_chemical_accuracy = None
+            if energy < best_energy:
+                best_energy = energy
+
+        vqe_energy = best_energy
+        print(f"Best VQE energy: {vqe_energy}", flush=True)
+
+    except Exception as e:
+        return {"solver_error": f"VQE failed: {str(e)}"}
+
+    # ==================================================
+    # Accuracy Check
+    # ==================================================
+
+    energy_error_hartree = None
+    energy_error_kcal = None
+    chemical_accuracy_met = None
 
     if exact_energy is not None:
-        error = abs(vqe_energy - exact_energy)
-        error_kcal = error * HARTREE_TO_KCAL
-        within_chemical_accuracy = error < CHEMICAL_ACCURACY_HARTREE
+        energy_error_hartree = abs(vqe_energy - exact_energy)
+        energy_error_kcal = energy_error_hartree * HARTREE_TO_KCAL
+        chemical_accuracy_met = energy_error_kcal <= CHEMICAL_ACCURACY_KCAL
 
-        print("Error (Hartree):", error)
-        print("Chemical accuracy achieved:", within_chemical_accuracy)
+        print(f"Energy error (kcal/mol): {energy_error_kcal}", flush=True)
+        print(f"Chemical accuracy met: {chemical_accuracy_met}", flush=True)
+
+    print("Finished compute_energies()", flush=True)
+    print("==============================\n", flush=True)
 
     return {
+        "mode": mode,
         "ansatz_used": ansatz_name,
         "num_qubits": num_qubits,
-        "num_parameters": ansatz.num_parameters,
-        "circuit_depth": ansatz.decompose().depth(),
-
-        "exact_energy": exact_energy,
-        "vqe_energy": vqe_energy,
-        "error": error,
-        "error_kcal_mol": error_kcal,
-        "within_chemical_accuracy": within_chemical_accuracy,
-
-        "convergence_history": convergence_history
+        "exact_energy_hartree": exact_energy,
+        "vqe_energy_hartree": vqe_energy,
+        "energy_error_hartree": energy_error_hartree,
+        "energy_error_kcal_mol": energy_error_kcal,
+        "chemical_accuracy_met": chemical_accuracy_met,
     }
