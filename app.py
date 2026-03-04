@@ -12,9 +12,17 @@ CORS(app)
 from quantum_engine.benchmark_module import run_benchmark
 
 
-@app.route("/benchmark", methods=["GET"])
+@app.route("/benchmark", methods=["POST"])
 def benchmark():
-    result = run_benchmark()
+
+    data = request.json
+    molecule = data.get("molecule")
+
+    if not molecule:
+        molecule = "H2"
+
+    result = run_benchmark(selected_molecule=molecule)
+
     return jsonify(result)
 
 
