@@ -104,7 +104,7 @@ def run_benchmark(selected_molecule="H2"):
         # Run Benchmark Mode (Full Space)
         # --------------------------------------------------
 
-        result = compute_energies(problem, mode="benchmark")
+        result = compute_energies(problem, label="benchmark",benchmark=False)
 
         if result.get("solver_error"):
             summary[name] = {
@@ -168,7 +168,7 @@ def run_benchmark(selected_molecule="H2"):
         # Structured JSON for Frontend
         # --------------------------------------------------
 
-        summary[name] = {
+        summary[name] = { 
             "exact_energy_hartree": exact_energy,
             "vqe_energy_hartree": vqe_energy,
             "delta_hartree": delta_hartree,

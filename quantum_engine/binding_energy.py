@@ -1,211 +1,240 @@
+import os
+
 from .molecule_builder import build_problem
 from .vqe_solver import compute_energies, HARTREE_TO_KCAL
 from .pdb_fragment_extractor import extract_residue_fragment
-from .database import DISEASE_TARGETS, DRUGS
-
-
-MAX_DRUG_HEAVY_ATOMS = 4
-
-
-# ==========================================================
-# Utility: Reduce Drug Fragment
-# ==========================================================
-def reduce_drug_fragment(atom_string):
-    heavy_atoms = []
-
-    for atom in atom_string.split(";"):
-        parts = atom.strip().split()
-        element = parts[0]
-
-        if element == "H":
-            continue
-
-        heavy_atoms.append(atom.strip())
-
-        if len(heavy_atoms) >= MAX_DRUG_HEAVY_ATOMS:
-            break
-
-    return "; ".join(heavy_atoms)
+from .pose_fragment_builder import build_ligand_atom_string_from_pose
+from .database import DISEASE_TARGETS
+from .vina_engine import run_vina
+from .pose_parameter_initializer import generate_pose_initial_params
 
 
 # ==========================================================
-# Utility: Ensure Even Electron Count
+# Closed Shell Enforcement
 # ==========================================================
+
 def enforce_closed_shell(atom_string, basis, charge):
-    """
-    Adjust charge to guarantee even total electrons.
-    """
 
-    problem = build_problem(
-        atom_string,
-        basis=basis,
-        charge=charge,
-    )
+    problem = build_problem(atom_string, basis=basis, charge=charge)
 
     num_alpha, num_beta = problem.num_particles
-    total_electrons = num_alpha + num_beta
+    total = num_alpha + num_beta
 
-    if total_electrons % 2 != 0:
-        adjusted_charge = charge + 1
-
-        problem = build_problem(
-            atom_string,
-            basis=basis,
-            charge=adjusted_charge,
-        )
-
-        return problem, adjusted_charge
+    if total % 2 != 0:
+        charge += 1
+        problem = build_problem(atom_string, basis=basis, charge=charge)
 
     return problem, charge
 
 
 # ==========================================================
+# VQE Worker
+# ==========================================================
+
+def run_vqe_for_pose(data):
+
+    complex_atom_string, pose_file = data
+
+    print("Running VQE for pose:", pose_file, flush=True)
+
+    problem, _ = enforce_closed_shell(complex_atom_string, "sto3g", 0)
+
+    initial_params = generate_pose_initial_params(
+        pose_file,
+        param_count=20
+    )
+
+    result = compute_energies(
+        problem,
+        label="POSE",
+        pose_initial=initial_params
+    )
+
+    if result.get("solver_error"):
+        print("VQE solver error for pose:", pose_file, flush=True)
+        return None
+
+    print("VQE completed for pose:", pose_file, flush=True)
+
+    return result
+
+
+# ==========================================================
 # Main Binding Function
 # ==========================================================
+
 def compute_binding_from_selection(
-    disease_name,
+    disease_key,
+    active_site_index,
     drug_name,
-    separation_distance=3.0,
     basis="sto3g",
+    separation_distance=None
 ):
 
     try:
 
-        # ------------------------------------------------
-        # Target Fragment
-        # ------------------------------------------------
-        target_info = DISEASE_TARGETS[disease_name]
+        # =====================================================
+        # Disease + Active Site
+        # =====================================================
+
+        disease_info = DISEASE_TARGETS[disease_key]
+        active_site = disease_info["active_sites"][active_site_index]
+
+        pdb_id = disease_info["pdb_id"]
+
+        # =====================================================
+        # Extract Target Fragment
+        # =====================================================
 
         target_atom_string, target_charge, _ = extract_residue_fragment(
-            pdb_id=target_info["pdb_id"],
-            chain_id=target_info["chain_id"],
-            residue_name=target_info["residue_name"],
-            residue_number=target_info["residue_number"],
-            atom_names=target_info["atom_names"],
-        )
 
-        # ------------------------------------------------
-        # Drug Fragment
-        # ------------------------------------------------
-        full_drug_atom_string = DRUGS[drug_name]["atom_string"]
-        drug_atom_string = reduce_drug_fragment(full_drug_atom_string)
-        drug_charge = 0
-
-        # ------------------------------------------------
-        # Shift Drug
-        # ------------------------------------------------
-        shifted_drug_atoms = []
-        for atom in drug_atom_string.split(";"):
-            parts = atom.strip().split()
-            element = parts[0]
-            x = float(parts[1])
-            y = float(parts[2])
-            z = float(parts[3]) + separation_distance
-            shifted_drug_atoms.append(f"{element} {x} {y} {z}")
-
-        shifted_drug_string = "; ".join(shifted_drug_atoms)
-
-        # ------------------------------------------------
-        # Complex Construction
-        # ------------------------------------------------
-        complex_atom_string = target_atom_string + "; " + shifted_drug_string
-        complex_charge = target_charge + drug_charge
-
-        # ------------------------------------------------
-        # Build Problems
-        # ------------------------------------------------
-        drug_problem, drug_charge = enforce_closed_shell(
-            drug_atom_string,
-            basis,
-            drug_charge,
+            pdb_id=pdb_id,
+            chain_id=active_site["chain_id"],
+            residue_name=active_site["residue_name"],
+            residue_number=active_site["residue_number"],
+            atom_names=active_site["atom_names"],
         )
 
         target_problem, target_charge = enforce_closed_shell(
             target_atom_string,
             basis,
-            target_charge,
+            target_charge
         )
 
-        complex_problem, complex_charge = enforce_closed_shell(
-            complex_atom_string,
-            basis,
-            complex_charge,
+        symbols = target_problem.molecule.symbols
+        coords = target_problem.molecule.coords
+
+        target_atom_string = "; ".join(
+            f"{sym} {x} {y} {z}"
+            for sym, (x, y, z) in zip(symbols, coords)
         )
 
-        # ------------------------------------------------
-        # Compute Energies
-        # ------------------------------------------------
-        drug_result = compute_energies(drug_problem)
-        target_result = compute_energies(target_problem)
-        complex_result = compute_energies(complex_problem)
+        print("Target fragment built", flush=True)
 
-        # -------------------------
-        # Solver Error Check
-        # -------------------------
-        for label, result in [
-            ("drug", drug_result),
-            ("target", target_result),
-            ("complex", complex_result),
-        ]:
-            if result.get("solver_error"):
-                return {
-                    "error": f"{label.capitalize()} calculation failed",
-                    "details": result["solver_error"],
-                }
+        # =====================================================
+        # Run Vina Docking
+        # =====================================================
 
-        # ------------------------------------------------
-        # Chemical Accuracy Gate
-        # ------------------------------------------------
-        accuracy_flags = [
-            drug_result["chemical_accuracy_met"],
-            target_result["chemical_accuracy_met"],
-            complex_result["chemical_accuracy_met"],
-        ]
+        print("Starting Vina docking...", flush=True)
 
-        if not all(flag is True for flag in accuracy_flags):
-            return {
-                "error": "Chemical accuracy not achieved for all systems.",
-                "accuracy_details": {
-                    "drug_error_kcal": drug_result["energy_error_kcal_mol"],
-                    "target_error_kcal": target_result["energy_error_kcal_mol"],
-                    "complex_error_kcal": complex_result["energy_error_kcal_mol"],
-                }
-            }
+        docking_result = run_vina(
+            receptor="pdb_files/protein.pdbqt",
+            ligand="pdb_files/ligand.pdbqt"
+        )
 
-        # ------------------------------------------------
-        # Extract Energies (Hartree)
-        # ------------------------------------------------
-        drug_energy = drug_result["vqe_energy_hartree"]
-        target_energy = target_result["vqe_energy_hartree"]
-        complex_energy = complex_result["vqe_energy_hartree"]
+        vina_best_affinity = docking_result["best_affinity"]
+        vina_top_poses = docking_result["top_poses"]
 
-        # ------------------------------------------------
-        # Binding Energy
-        # ------------------------------------------------
-        binding = complex_energy - (drug_energy + target_energy)
-        binding_kcal = binding * HARTREE_TO_KCAL
+        print("Docking completed. Best affinity:", vina_best_affinity, flush=True)
 
-        if binding_kcal < 0:
-            verdict = "Favorable Interaction"
-        else:
-            verdict = "Unfavorable Interaction"
+        # =====================================================
+        # Build Quantum Complexes
+        # =====================================================
+
+        pose_complexes = []
+
+        for pose in vina_top_poses:
+
+            pose_file = pose["structure_file"]
+
+            ligand_atom_string = build_ligand_atom_string_from_pose(pose_file)
+
+            complex_atom_string = target_atom_string + "; " + ligand_atom_string
+
+            pose_complexes.append((complex_atom_string, pose_file))
+
+        print("Quantum complexes built:", len(pose_complexes), flush=True)
+
+        # =====================================================
+        # Sequential VQE Execution
+        # =====================================================
+
+        results = []
+
+        for complex_atom_string, pose_file in pose_complexes:
+
+            result = run_vqe_for_pose((complex_atom_string, pose_file))
+
+            if result:
+                results.append({
+                    "pose_file": pose_file,
+                    "result": result
+                })
+
+        if not results:
+            return {"error": "All VQE runs failed"}
+
+        print("All VQE runs completed", flush=True)
+
+        # =====================================================
+        # Select Best Pose (Lowest Quantum Energy)
+        # =====================================================
+
+        best_entry = min(
+            results,
+            key=lambda r: r["result"]["vqe_energy_hartree"]
+        )
+
+        best_result = best_entry["result"]
+        best_pose_file = best_entry["pose_file"]
+
+        complex_energy = best_result["vqe_energy_hartree"]
+        complex_energy_kcal = complex_energy * HARTREE_TO_KCAL
+
+        convergence_history = best_result["convergence_history"]
+
+        # =====================================================
+        # Interaction Verdict
+        # =====================================================
+
+        verdict = (
+            "Favorable Interaction"
+            if vina_best_affinity < -2
+            else "Weak Interaction"
+        )
+
+        # =====================================================
+        # Clean Pose Filename
+        # =====================================================
+
+        best_pose_file = os.path.basename(best_pose_file)
+
+        # =====================================================
+        # Response (Quantum-focused)
+        # =====================================================
 
         return {
-            "disease": disease_name,
+
+            "disease": disease_key,
             "drug": drug_name,
-            "binding_hartree": float(binding),
-            "binding_kcal_mol": float(binding_kcal),
+
+            # Selected pose
+            "best_quantum_pose": best_pose_file,
+
+            # Quantum energy
+            "complex_energy": float(complex_energy),
+            "complex_energy_kcal": float(complex_energy_kcal),
+
+            # Interaction verdict
             "verdict": verdict,
-            "drug_qubits": drug_result["num_qubits"],
-            "target_qubits": target_result["num_qubits"],
-            "complex_qubits": complex_result["num_qubits"],
-            "drug_ansatz": drug_result["ansatz_used"],
-            "target_ansatz": target_result["ansatz_used"],
-            "complex_ansatz": complex_result["ansatz_used"],
-            "drug_error_kcal": drug_result["energy_error_kcal_mol"],
-            "target_error_kcal": target_result["energy_error_kcal_mol"],
-            "complex_error_kcal": complex_result["energy_error_kcal_mol"],
+
+            # Circuit metrics
+            "circuit_metrics": {
+                "active_orbitals": 4,
+                "active_electrons": 4,
+                "qubit_count": best_result["num_qubits"],
+                "circuit_depth": best_result["circuit_structure"]["depth"],
+                "gate_count": best_result["circuit_structure"]["gate_count"],
+            },
+
+            # VQE convergence
+            "convergence_data": convergence_history
         }
 
     except Exception as e:
-        return {"error": f"Binding computation failed: {str(e)}"}
+
+        print("Binding computation failed:", str(e), flush=True)
+
+        return {
+            "error": f"Binding computation failed: {str(e)}"
+        }
