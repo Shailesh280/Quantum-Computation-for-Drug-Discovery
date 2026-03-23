@@ -236,3 +236,49 @@ def extract_residue_fragment(
     )
 
     return atom_string, charge, spin
+
+def extract_pocket_fragment(pdb_file, ligand_atoms, cutoff=4.0, max_atoms=12):
+
+    parser = PDBParser(QUIET=True)
+    structure = parser.get_structure("protein", pdb_file)
+
+    pocket_atoms = []
+
+    ligand_coords = np.array([coord for _, coord in ligand_atoms])
+
+    for model in structure:
+        for chain in model:
+            for residue in chain:
+
+                for atom in residue:
+
+                    element = atom.element
+                    if element == "H":
+                        continue
+
+                    coord = atom.coord
+
+                    dists = np.linalg.norm(ligand_coords - coord, axis=1)
+
+                    if np.min(dists) <= cutoff:
+
+                        pocket_atoms.append((element, coord))
+
+                        if len(pocket_atoms) >= max_atoms:
+                            break
+
+    if not pocket_atoms:
+        raise ValueError("No pocket atoms detected")
+
+    atoms = cap_with_hydrogens(pocket_atoms)
+
+    atoms = stabilize_geometry(atoms)
+
+    charge, spin = compute_charge_and_spin(atoms)
+
+    atom_string = "; ".join(
+        f"{elem} {coord[0]:.6f} {coord[1]:.6f} {coord[2]:.6f}"
+        for elem, coord in atoms
+    )
+
+    return atom_string, charge, spin

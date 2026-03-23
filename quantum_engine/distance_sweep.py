@@ -3,7 +3,7 @@ import numpy as np
 from .molecule_builder import build_problem, auto_spin
 from .vqe_solver import compute_energies, HARTREE_TO_KCAL
 from .pdb_fragment_extractor import extract_residue_fragment
-from .database import DISEASE_TARGETS, DRUGS
+from .database import DISEASE_TARGETS
 
 
 def enforce_closed_shell(atom_string, basis, charge, freeze_core,

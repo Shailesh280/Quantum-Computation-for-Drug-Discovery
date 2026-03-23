@@ -12,6 +12,7 @@ from qiskit_nature.second_q.transformers import (
     FreezeCoreTransformer,
     ActiveSpaceTransformer,
 )
+import numpy as np
 
 settings.use_pauli_sum_op = False
 
@@ -50,12 +51,14 @@ def compute_energies(problem, label="SYSTEM", benchmark=False, pose_initial=None
     # -----------------------------
     # Freeze core
     # -----------------------------
-
-    try:
-        problem = FreezeCoreTransformer().transform(problem)
-        debug("Freeze core applied")
-    except Exception as e:
-        debug(f"Freeze core skipped: {e}")
+    if not benchmark:
+        try:
+            problem = FreezeCoreTransformer().transform(problem)
+            debug("Freeze core applied")
+        except Exception as e:
+            debug(f"Freeze core skipped: {e}")
+    else:
+        debug("Benchmark mode → skipping freeze core")
 
     num_alpha, num_beta = problem.num_particles
     total_electrons = num_alpha + num_beta
@@ -79,10 +82,13 @@ def compute_energies(problem, label="SYSTEM", benchmark=False, pose_initial=None
         f"Active space → electrons={active_electrons} orbitals={active_orbitals}"
     )
 
-    problem = ActiveSpaceTransformer(
-        num_electrons=active_electrons,
-        num_spatial_orbitals=active_orbitals,
-    ).transform(problem)
+    if not benchmark:
+        problem = ActiveSpaceTransformer(
+            num_electrons=active_electrons,
+            num_spatial_orbitals=active_orbitals,
+        ).transform(problem)
+    else:
+        debug("Active space transformation skipped")
 
     # -----------------------------
     # Hamiltonian construction
@@ -123,9 +129,10 @@ def compute_energies(problem, label="SYSTEM", benchmark=False, pose_initial=None
             exact_result = exact_solver.compute_minimum_eigenvalue(
                 qubit_op
             )
-
-            exact_energy = exact_result.eigenvalue.real
-
+            if benchmark:
+                exact_energy = exact_result.eigenvalue.real + problem.nuclear_repulsion_energy
+            else:
+                exact_energy = exact_result.eigenvalue.real
             debug(f"Exact energy = {exact_energy}")
 
         except Exception as e:
@@ -165,17 +172,17 @@ def compute_energies(problem, label="SYSTEM", benchmark=False, pose_initial=None
 
     if benchmark:
 
-        optimizer = L_BFGS_B(maxiter=250, ftol=1e-9)
+        optimizer = L_BFGS_B(maxiter=1000, ftol=1e-9)
 
     else:
 
-        optimizer = L_BFGS_B(maxiter=40, ftol=1e-6)
+        optimizer = L_BFGS_B(maxiter=400, ftol=1e-6)
 
     # -----------------------------
     # Parameter initialization
     # -----------------------------
 
-    initial_point = np.zeros(param_count)
+    initial_point = np.zeros(ansatz.num_parameters)
 
     # -----------------------------
     # Convergence tracking
@@ -211,9 +218,10 @@ def compute_energies(problem, label="SYSTEM", benchmark=False, pose_initial=None
     )
 
     result = vqe.compute_minimum_eigenvalue(qubit_op)
-
-    vqe_energy = result.eigenvalue.real
-
+    if benchmark:
+        vqe_energy = result.eigenvalue.real + problem.nuclear_repulsion_energy
+    else:
+        vqe_energy = result.eigenvalue.real 
     debug(f"VQE finished in {time.time() - start:.2f}s")
 
     # -----------------------------

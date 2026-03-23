@@ -104,7 +104,7 @@ def run_benchmark(selected_molecule="H2"):
         # Run Benchmark Mode (Full Space)
         # --------------------------------------------------
 
-        result = compute_energies(problem, label="benchmark",benchmark=False)
+        result = compute_energies(problem, label="benchmark",benchmark=True)
 
         if result.get("solver_error"):
             summary[name] = {

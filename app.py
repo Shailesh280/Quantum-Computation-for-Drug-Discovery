@@ -12,11 +12,8 @@ app = Flask(__name__)
 CORS(app)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-POSE_DIR = os.path.join(BASE_DIR, "docking_results")
+POSE_DIR = os.path.join(BASE_DIR, "./data/docking_results")
 
-@app.route("/poses/<filename>")
-def get_pose(filename):
-    return send_from_directory(POSE_DIR, filename)
 # =========================================================
 # Benchmark Endpoint
 # =========================================================
@@ -58,6 +55,10 @@ def get_diseases():
 # Get Active Sites + Drugs for Disease
 # =========================================================
 
+@app.route("/poses/<filename>")
+def get_pose(filename):
+    return send_from_directory(POSE_DIR, filename)
+
 @app.route("/disease_details/<disease_key>", methods=["GET"])
 def get_disease_details(disease_key):
 
@@ -92,7 +93,6 @@ def binding():
     data = request.get_json()
 
     disease_key = data.get("disease_key")
-    active_site_index = data.get("active_site_index")
     drug_name = data.get("drug_name")
 
     separation_distance = data.get("separation_distance", 3.0)
@@ -100,7 +100,6 @@ def binding():
 
     result = compute_binding_from_selection(
         disease_key=disease_key,
-        active_site_index=active_site_index,
         drug_name=drug_name,
         separation_distance=separation_distance,
         basis=basis,
